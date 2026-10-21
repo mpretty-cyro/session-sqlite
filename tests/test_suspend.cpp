@@ -74,10 +74,14 @@ TEST_CASE("suspend closes every connection and refuses new ones", "[suspend]") {
         auto b = db.unique_conn();
     }
 
+    REQUIRE(db.open_connections() == 2);
     auto result = db.suspend(0ms);
     CHECK(result.closed);
     CHECK_FALSE(result.checkpointed);
     CHECK(db.suspended());
+    // What the outsider below cannot tell apart: an idle connection still open holds a lock on the
+    // shared-memory file without stopping its exclusive lock or its checkpoint.
+    CHECK(db.open_connections() == 0);
     CHECK_THROWS_AS(db.conn(), database_suspended);
     CHECK_THROWS_AS(db.unique_conn(), database_suspended);
 
@@ -160,16 +164,31 @@ TEST_CASE("suspend with interrupt stops a running statement", "[suspend]") {
                 c.sql,
                 "WITH RECURSIVE n(i) AS (SELECT 1 UNION ALL SELECT i + 1 FROM n) "
                 "SELECT count(*) FROM n"};
-        running.count_down();
+        // Called from inside the running statement, so the interrupt cannot land before it starts
+        // -- where it would do nothing and the statement would run for ever.
+        std::atomic<bool> started{false};
+        struct Progress {
+            std::latch& running;
+            std::atomic<bool>& started;
+        } progress{running, started};
+        sqlite3_progress_handler(
+                c.sql.getHandle(),
+                1000,
+                [](void* p) {
+                    auto& [running, started] = *static_cast<Progress*>(p);
+                    if (!started.exchange(true))
+                        running.count_down();
+                    return 0;
+                },
+                &progress);
         try {
             st.executeStep();
         } catch (const SQLite::Exception& e) {
             interrupted = (e.getErrorCode() & 0xff) == SQLITE_INTERRUPT;
         }
+        sqlite3_progress_handler(c.sql.getHandle(), 0, nullptr, nullptr);
     }};
     running.wait();
-    // Give the statement time to start stepping.
-    std::this_thread::sleep_for(50ms);
     auto result = db.suspend(5s, true);
     holder.join();
 
@@ -209,8 +228,35 @@ TEST_CASE("suspend can checkpoint and truncate the WAL", "[suspend]") {
     CHECK(std::filesystem::file_size(wal) == 0);
     CHECK(other.exclusive());
 
+    // The checkpoint's own connection is not left behind in the pool.
+    CHECK(db.open_connections() == 0);
+
     db.resume();
     CHECK(db.conn().prepared_get<int>("SELECT count(*) FROM foo") == 401);
+}
+
+TEST_CASE("a checkpoint the other process blocks gives up within the wait", "[suspend]") {
+    // Opening a connection reads the database, and the pool's busy timeout is far longer than the
+    // wait: the checkpoint's connection has to be opened within the wait too.
+    TempPath tmp;
+    Database db{tmp.path, busy_timeout{10s}};
+    make_table(db);
+    Outsider other{tmp.path};
+    REQUIRE(sqlite3_exec(other.db, "BEGIN EXCLUSIVE", nullptr, nullptr, nullptr) == SQLITE_OK);
+    REQUIRE(sqlite3_exec(other.db, "INSERT INTO foo VALUES (1)", nullptr, nullptr, nullptr) ==
+            SQLITE_OK);
+
+    auto start = std::chrono::steady_clock::now();
+    Database::suspend_result result;
+    CHECK_NOTHROW(result = db.suspend(200ms, false, true));
+    CHECK(std::chrono::steady_clock::now() - start < 3s);
+    CHECK(result.closed);
+    CHECK_FALSE(result.checkpointed);
+    CHECK(db.open_connections() == 0);
+
+    sqlite3_exec(other.db, "ROLLBACK", nullptr, nullptr, nullptr);
+    db.resume();
+    CHECK(db.conn().prepared_get<int>("SELECT count(*) FROM foo") == 1);
 }
 
 TEST_CASE("resume ends a suspend still waiting", "[suspend]") {
@@ -236,6 +282,7 @@ TEST_CASE("an in-memory database survives suspend", "[suspend][memory]") {
     make_table(db);
 
     CHECK(db.suspend(0ms).closed);
+    CHECK(db.open_connections() == 1);
     CHECK_THROWS_AS(db.conn(), database_suspended);
     db.resume();
     CHECK(db.conn().prepared_get<int>("SELECT x FROM foo") == 42);
@@ -256,4 +303,69 @@ TEST_CASE("a refused connection is reported before it throws", "[suspend]") {
     db.resume();
     CHECK_NOTHROW(db.conn());
     CHECK(refused == 2);
+}
+
+TEST_CASE("a held thread waits for the resume instead of being refused", "[suspend][hold]") {
+    TempPath tmp;
+    Database db{tmp.path};
+    make_table(db);
+    // Written by the held thread under the pool's lock, so read here only once it is joined --
+    // except the count, which says when it has begun waiting.
+    std::atomic<int> holds{0};
+    std::vector<std::chrono::milliseconds> waited;
+    db.on_hold(
+            [&](auto w) {
+                waited.push_back(w);
+                holds++;
+            },
+            40ms);
+    int refused = 0;
+    db.on_refused([&] { refused++; });
+
+    std::latch registered{1};
+    std::atomic<int> got{0};
+    std::atomic<bool> stop{false};
+    std::thread held{[&] {
+        db.hold_while_suspended(std::this_thread::get_id());
+        registered.count_down();
+        while (!stop) {
+            got = db.conn().prepared_get<int>("SELECT x FROM foo");
+            std::this_thread::sleep_for(5ms);
+        }
+        db.stop_holding(std::this_thread::get_id());
+    }};
+    registered.wait();
+
+    REQUIRE(db.suspend(1s).closed);
+    for (int i = 0; i < 200 && holds == 0; i++)
+        std::this_thread::sleep_for(5ms);
+    REQUIRE(holds > 0);
+    got = 0;
+    std::this_thread::sleep_for(150ms);
+    CHECK(got == 0);
+    CHECK(db.open_connections() == 0);
+    // Other threads are still refused.
+    CHECK_THROWS_AS(db.conn(), database_suspended);
+    CHECK(refused == 1);
+
+    db.resume();
+    for (int i = 0; i < 200 && got == 0; i++)
+        std::this_thread::sleep_for(5ms);
+    stop = true;
+    held.join();
+    CHECK(got == 42);
+    REQUIRE(waited.size() >= 3);
+    CHECK(waited[0] == 0ms);
+    CHECK(waited[1] >= 40ms);
+}
+
+TEST_CASE("a thread no longer held is refused again", "[suspend][hold]") {
+    TempPath tmp;
+    Database db{tmp.path};
+    auto me = std::this_thread::get_id();
+    db.hold_while_suspended(me);
+    db.stop_holding(me);
+    db.suspend(0ms);
+    CHECK_THROWS_AS(db.conn(), database_suspended);
+    db.resume();
 }

@@ -308,18 +308,20 @@ Database::suspend_result Database::suspend(
     if (!result.closed || !checkpoint || _memory || !_wal)
         return result;
 
-    // A connection of its own, outside the pool: tracked as in use like any other, and dropped
-    // rather than kept when returned, since the database is suspended.
-    auto c = get_or_make_conn(std::thread::id{});
+    // A connection of its own, outside the pool and opened without its lock, so that a resume can
+    // go ahead meanwhile and never sees it.  Opening reads the database, so it too is held to what
+    // remains of `wait`.
     lock.unlock();
-    auto left = std::chrono::duration_cast<std::chrono::milliseconds>(
-            deadline - std::chrono::steady_clock::now());
-    sqlite3_busy_timeout(c.sql.getHandle(), std::max<int>(0, static_cast<int>(left.count())));
     try {
+        auto left = std::max(
+                std::chrono::milliseconds{0},
+                std::chrono::duration_cast<std::chrono::milliseconds>(
+                        deadline - std::chrono::steady_clock::now()));
+        auto c = open_conn(0, left);
         // One row: whether it was blocked, the WAL's frames, and how many were checkpointed.
-        SQLite::Statement st{c.sql, "PRAGMA wal_checkpoint(TRUNCATE)"};
+        SQLite::Statement st{c->sql, "PRAGMA wal_checkpoint(TRUNCATE)"};
         result.checkpointed = st.executeStep() && st.getColumn(0).getInt() == 0;
-    } catch (const SQLite::Exception&) {
+    } catch (const std::exception&) {
         // Busy past the deadline, or the WAL could not be truncated: the WAL is left as it is.
     }
     return result;
@@ -341,10 +343,46 @@ void Database::on_refused(std::function<void()> f) {
     _on_refused = std::move(f);
 }
 
-void Database::refuse() {
-    if (_on_refused)
-        _on_refused();
-    throw database_suspended{"the database is suspended"};
+void Database::hold_while_suspended(std::thread::id tid) {
+    std::lock_guard lock{_conn_mutex};
+    if (std::find(_held.begin(), _held.end(), tid) == _held.end())
+        _held.push_back(tid);
+}
+
+void Database::stop_holding(std::thread::id tid) {
+    std::lock_guard lock{_conn_mutex};
+    std::erase(_held, tid);
+}
+
+void Database::on_hold(
+        std::function<void(std::chrono::milliseconds)> f, std::chrono::milliseconds interval) {
+    std::lock_guard lock{_conn_mutex};
+    _on_hold = std::move(f);
+    _hold_interval = interval;
+}
+
+size_t Database::open_connections() {
+    std::lock_guard lock{_conn_mutex};
+    return _conn_in_use.size() + _conn_unused.size();
+}
+
+void Database::wait_while_suspended(std::unique_lock<std::mutex>& lock) {
+    if (!_suspended)
+        return;
+    if (std::find(_held.begin(), _held.end(), std::this_thread::get_id()) == _held.end()) {
+        if (_on_refused)
+            _on_refused();
+        throw database_suspended{"the database is suspended"};
+    }
+    auto start = std::chrono::steady_clock::now();
+    for (auto next = start; _suspended;) {
+        if (auto now = std::chrono::steady_clock::now(); now >= next) {
+            if (_on_hold)
+                _on_hold(std::chrono::duration_cast<std::chrono::milliseconds>(now - start));
+            next = now + _hold_interval;
+        }
+        _conn_cv.wait_until(lock, next, [this] { return !_suspended; });
+    }
 }
 
 void Database::set_max_idle_conns(int max_idle) {
@@ -367,9 +405,22 @@ Connection Database::get_or_make_conn(std::thread::id tid, int extra_open_flags)
 
     // Run out of idle connections so we need to make a new one (this also gets called during
     // construction for the very first connection)
+    auto conn = open_conn(extra_open_flags, _busy_timeout);
 
+    Connection c{*this, conn};
+
+    if (_post_open)
+        _post_open(c);
+
+    _conn_in_use.emplace_back(tid, std::move(conn));
+
+    return c;
+}
+
+std::shared_ptr<detail::conn> Database::open_conn(
+        int extra_open_flags, std::chrono::milliseconds busy_timeout) {
     auto conn = std::make_shared<detail::conn>(
-            _db_path, _open_flags | extra_open_flags, static_cast<int>(_busy_timeout.count()));
+            _db_path, _open_flags | extra_open_flags, static_cast<int>(busy_timeout.count()));
 
     auto& sql = conn->sql;
 
@@ -483,34 +534,25 @@ Connection Database::get_or_make_conn(std::thread::id tid, int extra_open_flags)
         throw std::runtime_error{"Failed to enable foreign key integrity: "s + e.what()};
     }
 
-    Connection c{*this, conn};
-
-    if (_post_open)
-        _post_open(c);
-
-    _conn_in_use.emplace_back(tid, std::move(conn));
-
-    return c;
+    return conn;
 }
 
 Connection Database::unique_conn() {
-    std::lock_guard lock{_conn_mutex};
-    if (_suspended)
-        refuse();
+    std::unique_lock lock{_conn_mutex};
+    wait_while_suspended(lock);
     return get_or_make_conn(std::thread::id{});
 }
 
 Connection Database::conn() {
-    std::lock_guard lock{_conn_mutex};
+    std::unique_lock lock{_conn_mutex};
 
     auto t = std::this_thread::get_id();
     for (auto& [th, conn] : _conn_in_use)
         if (th == t)
             return Connection{*this, conn};
 
-    if (_suspended)
-        refuse();
-    return get_or_make_conn(std::this_thread::get_id());
+    wait_while_suspended(lock);
+    return get_or_make_conn(t);
 }
 
 Database::~Database() {
