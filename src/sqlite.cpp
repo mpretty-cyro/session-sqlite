@@ -374,13 +374,24 @@ void Database::wait_while_suspended(std::unique_lock<std::mutex>& lock) {
             _on_refused();
         throw database_suspended{"the database is suspended"};
     }
-    auto start = std::chrono::steady_clock::now();
-    for (auto next = start; _suspended;) {
-        if (auto now = std::chrono::steady_clock::now(); now >= next) {
-            if (_on_hold)
-                _on_hold(std::chrono::duration_cast<std::chrono::milliseconds>(now - start));
+    // Only time the process was running counts as waiting.  A process suspended with the app (iOS
+    // freezes it) wakes long past its deadline, and that stretch is not a resume that failed to
+    // come - only one that could not have come yet.
+    std::chrono::steady_clock::duration waited{};
+    auto last = std::chrono::steady_clock::now();
+    for (auto next = last; _suspended;) {
+        auto now = std::chrono::steady_clock::now();
+        if (now > next + _hold_interval)
             next = now + _hold_interval;
+        else {
+            waited += now - last;
+            if (now >= next) {
+                if (_on_hold)
+                    _on_hold(std::chrono::duration_cast<std::chrono::milliseconds>(waited));
+                next = now + _hold_interval;
+            }
         }
+        last = now;
         _conn_cv.wait_until(lock, next, [this] { return !_suspended; });
     }
 }
@@ -499,6 +510,7 @@ std::shared_ptr<detail::conn> Database::open_conn(
 
 #if defined(SESSION_SQLITE_SQLCIPHER) || defined(SESSION_SQLITE_MULTIPLE_CIPHERS)
     if (_enc != Encryption::None) {
+        std::lock_guard key_lock{_key_mutex};
         auto ro = _key.access();
         // A failure here (e.g. a VFS without the encryption shim) would otherwise carry on and
         // silently give an unencrypted database.

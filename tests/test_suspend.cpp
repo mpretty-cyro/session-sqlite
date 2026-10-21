@@ -369,3 +369,41 @@ TEST_CASE("a thread no longer held is refused again", "[suspend][hold]") {
     CHECK_THROWS_AS(db.conn(), database_suspended);
     db.resume();
 }
+
+TEST_CASE(
+        "a checkpoint and a connection after a resume open an encrypted database together",
+        "[suspend][hold]") {
+    // The checkpoint's connection is opened without the pool's lock, so that a resume can go
+    // ahead meanwhile - and a held thread released by that resume opens one of its own at the same
+    // time.  Both read the key, whose buffer is unlocked and relocked around each read.
+    if (!enabled(Encryption::AEGIS256))
+        SKIP("AEGIS256 not supported by this build");
+    TempPath tmp;
+    std::array<std::byte, 32> key;
+    for (size_t i = 0; i < key.size(); ++i)
+        key[i] = static_cast<std::byte>(i * 7 + 1);
+    Database db{tmp.path, Encryption::AEGIS256, raw_key{key}};
+    make_table(db);
+    db.on_hold([](auto) {});
+
+    std::atomic<bool> stop{false};
+    std::latch registered{1};
+    std::thread held{[&] {
+        db.hold_while_suspended(std::this_thread::get_id());
+        registered.count_down();
+        while (!stop)
+            CHECK(db.unique_conn().prepared_get<int>("SELECT x FROM foo") == 42);
+        db.stop_holding(std::this_thread::get_id());
+    }};
+    registered.wait();
+
+    for (int i = 0; i < 50; ++i) {
+        std::thread suspender{[&] { db.suspend(1s, false, true); }};
+        std::this_thread::sleep_for(std::chrono::microseconds{100 * (i % 7)});
+        db.resume();
+        suspender.join();
+        db.resume();
+    }
+    stop = true;
+    held.join();
+}

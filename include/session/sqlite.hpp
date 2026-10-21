@@ -859,9 +859,11 @@ class Database {
     std::mutex _conn_mutex;
 
     // Opens and sets up a new connection, outside the pool and without `_post_open`.  Touches no
-    // pool state, so needs no lock.
+    // pool state, so needs no pool lock - but it reads `_key`, whose buffer unlocks and relocks its
+    // memory around each read with a plain counter, so two opens at once take `_key_mutex`.
     std::shared_ptr<detail::conn> open_conn(
             int extra_open_flags, std::chrono::milliseconds busy_timeout);
+    std::mutex _key_mutex;
 
     // Set by `suspend()`, cleared by `resume()`.  `_conn_cv` is notified whenever a connection is
     // returned and on resume: a suspend waiting for held connections waits on it, and so does a
@@ -1038,9 +1040,10 @@ class Database {
     void stop_holding(std::thread::id tid);
 
     // Called on a held thread when it begins waiting for a resume, with 0, and again every
-    // `interval` that it is still waiting, with how long it has waited: a short wait is expected
-    // work arriving while suspended, a long one a resume that never came.  Called with the pool's
-    // lock held, so it must not touch the database.
+    // `interval` that it is still waiting, with how long it has waited.  Only time the process was
+    // running counts: a wake far past its deadline is taken as the process having been frozen, as
+    // iOS freezes a suspended app, and that stretch is neither counted nor reported.  Called with
+    // the pool's lock held, so it must not touch the database.
     void on_hold(
             std::function<void(std::chrono::milliseconds waited)> f,
             std::chrono::milliseconds interval = std::chrono::seconds{30});
