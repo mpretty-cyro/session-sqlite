@@ -4,7 +4,6 @@
 #include <catch2/catch_test_macros.hpp>
 #include <chrono>
 #include <filesystem>
-#include <latch>
 #include <random>
 #include <session/sqlite.hpp>
 #include <string>
@@ -14,6 +13,17 @@ using namespace session::sqlite;
 using namespace std::literals;
 
 namespace {
+
+// A one-shot signal between threads, waited on by spinning: a latch is not available on the macOS
+// deployment target.
+struct Gate {
+    std::atomic<bool> open{false};
+    void count_down() { open = true; }
+    void wait() const {
+        while (!open)
+            std::this_thread::yield();
+    }
+};
 
 // A database file in the temp directory, removed (with its WAL and shared-memory files) afterwards.
 struct TempPath {
@@ -99,7 +109,7 @@ TEST_CASE("suspend waits for a held connection, which can still finish", "[suspe
     Database db{tmp.path};
     make_table(db);
 
-    std::latch holding{1}, suspending{1};
+    Gate holding, suspending;
     std::atomic<bool> finished{false};
     std::thread holder{[&] {
         auto c = db.conn();
@@ -155,7 +165,7 @@ TEST_CASE("suspend with interrupt stops a running statement", "[suspend]") {
     Database db{tmp.path};
     make_table(db);
 
-    std::latch running{1};
+    Gate running;
     std::atomic<bool> interrupted{false};
     std::thread holder{[&] {
         auto c = db.conn();
@@ -168,7 +178,7 @@ TEST_CASE("suspend with interrupt stops a running statement", "[suspend]") {
         // -- where it would do nothing and the statement would run for ever.
         std::atomic<bool> started{false};
         struct Progress {
-            std::latch& running;
+            Gate& running;
             std::atomic<bool>& started;
         } progress{running, started};
         sqlite3_progress_handler(
@@ -322,7 +332,7 @@ TEST_CASE("a held thread waits for the resume instead of being refused", "[suspe
     int refused = 0;
     db.on_refused([&] { refused++; });
 
-    std::latch registered{1};
+    Gate registered;
     std::atomic<int> got{0};
     std::atomic<bool> stop{false};
     std::thread held{[&] {
@@ -387,7 +397,7 @@ TEST_CASE(
     db.on_hold([](auto) {});
 
     std::atomic<bool> stop{false};
-    std::latch registered{1};
+    Gate registered;
     std::thread held{[&] {
         db.hold_while_suspended(std::this_thread::get_id());
         registered.count_down();
