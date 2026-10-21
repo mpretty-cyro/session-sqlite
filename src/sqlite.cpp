@@ -13,6 +13,7 @@
 #include <sodium/utils.h>
 #include <sqlite3.h>
 
+#include <algorithm>
 #include <atomic>
 #include <cstdint>
 #include <fstream>
@@ -151,6 +152,7 @@ Database::Database(
         _db_path = "file:/session-sqlite-memdb-" + std::to_string(++memdb_counter) +
                    "?vfs=" + vfs;
         _open_flags |= SQLite::OPEN_URI;
+        _memory = true;
 
         // memdb has no shared memory support, so WAL is impossible.  Plain memdb just refuses the
         // journal_mode change, but sqlite3mc's shim advertises an xShmMap that forwards to memdb's
@@ -269,14 +271,80 @@ void Database::conn_returned() {
         auto& [th, conn] = *it;
         assert(conn);  // If we end up with a dead pointer in here then some code is broken
         if (conn.use_count() == 1) {
-            if (_conn_max_idle < 0 || _conn_unused.size() < static_cast<size_t>(_conn_max_idle))
+            if (keep_idle())
                 _conn_unused.push_back(std::move(conn));
-            // else we have enough idle connections so let it drop
+            // else we have enough idle connections (or are suspended) so let it drop
 
             it = _conn_in_use.erase(it);
         } else
             ++it;
     }
+    _conn_cv.notify_all();
+}
+
+bool Database::keep_idle() const {
+    if (_suspended)
+        return _memory && _conn_unused.empty();
+    return _conn_max_idle < 0 || _conn_unused.size() < static_cast<size_t>(_conn_max_idle);
+}
+
+Database::suspend_result Database::suspend(
+        std::chrono::milliseconds wait, bool interrupt, bool checkpoint) {
+    auto deadline = std::chrono::steady_clock::now() + wait;
+    std::unique_lock lock{_conn_mutex};
+    _suspended = true;
+
+    if (_conn_unused.size() > (_memory ? 1 : 0))
+        _conn_unused.resize(_memory ? 1 : 0);
+    if (interrupt)
+        for (auto& [th, c] : _conn_in_use)
+            sqlite3_interrupt(c->sql.getHandle());
+
+    suspend_result result;
+    result.closed = _conn_cv.wait_until(lock, deadline, [this] {
+        return !_suspended || _conn_in_use.empty();
+    }) && _suspended;
+
+    if (!result.closed || !checkpoint || _memory || !_wal)
+        return result;
+
+    // A connection of its own, outside the pool: tracked as in use like any other, and dropped
+    // rather than kept when returned, since the database is suspended.
+    auto c = get_or_make_conn(std::thread::id{});
+    lock.unlock();
+    auto left = std::chrono::duration_cast<std::chrono::milliseconds>(
+            deadline - std::chrono::steady_clock::now());
+    sqlite3_busy_timeout(c.sql.getHandle(), std::max<int>(0, static_cast<int>(left.count())));
+    try {
+        // One row: whether it was blocked, the WAL's frames, and how many were checkpointed.
+        SQLite::Statement st{c.sql, "PRAGMA wal_checkpoint(TRUNCATE)"};
+        result.checkpointed = st.executeStep() && st.getColumn(0).getInt() == 0;
+    } catch (const SQLite::Exception&) {
+        // Busy past the deadline, or the WAL could not be truncated: the WAL is left as it is.
+    }
+    return result;
+}
+
+void Database::resume() {
+    std::lock_guard lock{_conn_mutex};
+    _suspended = false;
+    _conn_cv.notify_all();
+}
+
+bool Database::suspended() {
+    std::lock_guard lock{_conn_mutex};
+    return _suspended;
+}
+
+void Database::on_refused(std::function<void()> f) {
+    std::lock_guard lock{_conn_mutex};
+    _on_refused = std::move(f);
+}
+
+void Database::refuse() {
+    if (_on_refused)
+        _on_refused();
+    throw database_suspended{"the database is suspended"};
 }
 
 void Database::set_max_idle_conns(int max_idle) {
@@ -427,6 +495,8 @@ Connection Database::get_or_make_conn(std::thread::id tid, int extra_open_flags)
 
 Connection Database::unique_conn() {
     std::lock_guard lock{_conn_mutex};
+    if (_suspended)
+        refuse();
     return get_or_make_conn(std::thread::id{});
 }
 
@@ -438,6 +508,8 @@ Connection Database::conn() {
         if (th == t)
             return Connection{*this, conn};
 
+    if (_suspended)
+        refuse();
     return get_or_make_conn(std::this_thread::get_id());
 }
 
