@@ -606,13 +606,13 @@ TEST_CASE(
     CHECK(db.conn().prepared_get<int>("SELECT count(*) FROM foo") == 2);
 }
 
-TEST_CASE(
-        "begin_immediate's deferred checkpoint runs before a suspend's own",
-        "[suspend][transactions]") {
+TEST_CASE("a suspend waits for begin_immediate's deferred checkpoint", "[suspend][transactions]") {
     // The checkpoint a COMMIT leaves for after the write lock is released runs on the connection
-    // its thread still holds, so it ends before that connection is returned -- and the suspend's
-    // checkpoint opens only once every connection is closed.
-    TempPath tmp;
+    // its thread still holds, so it ends before that connection is returned -- and so before a
+    // suspend that waits for every connection returns.  The suspend is told not to checkpoint, so
+    // that the rows reaching the main file can only be the deferred checkpoint's doing; `other`
+    // keeps the WAL from being checkpointed and removed as the last pool connection closes.
+    TempPath tmp, copy;
     constexpr int threshold = 50;
     Database db{tmp.path, post_open{[](Connection& c) {
                     c.sql.exec("PRAGMA wal_autocheckpoint = " + std::to_string(threshold));
@@ -620,7 +620,6 @@ TEST_CASE(
     make_table(db);
     Outsider other{tmp.path};
     other.touch();
-    auto wal = std::filesystem::path{tmp.path.string() + "-wal"};
 
     Gate holding, release;
     std::thread holder{[&] {
@@ -636,16 +635,24 @@ TEST_CASE(
     holding.wait();
 
     Database::suspend_result result;
-    std::thread suspender{[&] { result = db.suspend(10s, false, true); }};
+    std::thread suspender{[&] { result = db.suspend(10s, false, false); }};
     std::this_thread::sleep_for(50ms);
     release.count_down();
     holder.join();
     suspender.join();
 
     CHECK(result.closed);
-    CHECK(result.checkpointed);
-    CHECK(std::filesystem::file_size(wal) == 0);
+    CHECK_FALSE(result.checkpointed);
     CHECK(db.open_connections() == 0);
+
+    // The main file alone, without the WAL beside it.
+    std::filesystem::copy_file(tmp.path, copy.path);
+    Outsider main_only{copy.path};
+    sqlite3_stmt* st = nullptr;
+    REQUIRE(sqlite3_prepare_v2(main_only.db, "SELECT count(*) FROM foo", -1, &st, nullptr) ==
+            SQLITE_OK);
+    REQUIRE(sqlite3_step(st) == SQLITE_ROW);
+    CHECK(sqlite3_column_int(st, 0) == 2 * threshold + 1);
+    sqlite3_finalize(st);
     db.resume();
-    CHECK(db.conn().prepared_get<int>("SELECT count(*) FROM foo") == 2 * threshold + 1);
 }
