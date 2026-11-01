@@ -494,9 +494,11 @@ bool detail::fifo_lock::held_by_this_thread() {
 }
 
 ImmediateTransaction::ImmediateTransaction(
-        Database& db, detail::conn& conn, std::optional<std::chrono::milliseconds> timeout) :
-        _db{db}, _conn{conn} {
-    auto& sql = conn.sql;
+        Database& db,
+        std::shared_ptr<detail::conn> conn,
+        std::optional<std::chrono::milliseconds> timeout) :
+        _db{db}, _conn{std::move(conn)} {
+    auto& sql = _conn->sql;
     if (db._write_lock.held_by_this_thread())
         throw SQLite::Exception{
                 "begin_immediate() would deadlock: this thread already holds the database's "
@@ -535,25 +537,27 @@ ImmediateTransaction::ImmediateTransaction(
     }
     if (left != usual)
         sqlite3_busy_timeout(handle, usual);
-    conn.in_immediate = true;
+    _conn->in_immediate = true;
     _acquired = std::chrono::steady_clock::now();
 }
 
 ImmediateTransaction::~ImmediateTransaction() {
     if (_tx)
         finish();
+    _conn.reset();
+    _db.conn_returned();
 }
 
 void ImmediateTransaction::finish() {
     _tx.reset();
     const auto released = std::chrono::steady_clock::now();
-    _conn.in_immediate = false;
-    const bool checkpoint = std::exchange(_conn.checkpoint_due, false);
+    _conn->in_immediate = false;
+    const bool checkpoint = std::exchange(_conn->checkpoint_due, false);
     _db._write_lock.unlock();
     // The checkpoint the COMMIT would have run (see detail::conn::install_wal_hook)
     if (checkpoint)
         sqlite3_wal_checkpoint_v2(
-                _conn.sql.getHandle(), nullptr, SQLITE_CHECKPOINT_PASSIVE, nullptr, nullptr);
+                _conn->sql.getHandle(), nullptr, SQLITE_CHECKPOINT_PASSIVE, nullptr, nullptr);
     if (_db._write_lock_observer && released - _requested >= _db._write_lock_observer_threshold)
         _db._write_lock_observer(_acquired - _requested, released - _acquired);
 }
@@ -583,7 +587,7 @@ void ImmediateTransaction::rollback() {
 }
 
 ImmediateTransaction Connection::begin_immediate(std::optional<std::chrono::milliseconds> timeout) {
-    return ImmediateTransaction{db, *_conn, timeout};
+    return ImmediateTransaction{db, _conn, timeout};
 }
 
 StatementWrapper Connection::prepared_st(std::string_view query) {

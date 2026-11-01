@@ -590,3 +590,54 @@ TEST_CASE("the WAL is still checkpointed at the connection's threshold", "[trans
         CHECK(wal_size() > writes * 3000);
     }
 }
+
+TEST_CASE(
+        "an ImmediateTransaction keeps its connection from another thread after the Connection "
+        "it was begun from is gone",
+        "[transactions]") {
+    TempPath tmp;
+    Database db{tmp.path};
+    db.conn().sql.exec("CREATE TABLE foo (x INTEGER)");
+
+    auto tx = db.conn().begin_immediate();
+
+    // The transaction's connection is still this thread's, rather than idle and free to be taken
+    bool other_in_transaction = true;
+    std::thread other{[&] {
+        auto c = db.conn();
+        other_in_transaction = !sqlite3_get_autocommit(c.sql.getHandle());
+    }};
+    other.join();
+    CHECK_FALSE(other_in_transaction);
+
+    auto c = db.conn();
+    CHECK_FALSE(sqlite3_get_autocommit(c.sql.getHandle()));
+    c.prepared_exec("INSERT INTO foo VALUES (1)");
+    tx.commit();
+    CHECK(sqlite3_get_autocommit(c.sql.getHandle()));
+    CHECK(c.prepared_get<int>("SELECT count(*) FROM foo") == 1);
+}
+
+TEST_CASE(
+        "an ImmediateTransaction keeps its connection open after the Connection it was begun from "
+        "is gone",
+        "[transactions]") {
+    TempPath tmp;
+    Database db{tmp.path};
+    db.conn().sql.exec("CREATE TABLE foo (x INTEGER)");
+    // Every connection is closed as soon as nothing is using it
+    db.set_max_idle_conns(0);
+
+    {
+        auto tx = db.conn().begin_immediate();
+        db.conn().prepared_exec("INSERT INTO foo VALUES (1)");
+        tx.commit();
+    }
+    {
+        auto tx = db.conn().begin_immediate();
+        db.conn().prepared_exec("INSERT INTO foo VALUES (2)");
+        // Rolled back by its destructor
+    }
+    CHECK(db.conn().prepared_get<int>("SELECT count(*) FROM foo") == 1);
+    CHECK(can_write_elsewhere(tmp.path));
+}

@@ -1123,14 +1123,19 @@ class IterableStatementWrapper : StatementWrapper {
 /// that throws leaves the transaction open, so both locks stay held until it is destroyed.
 class ImmediateTransaction {
     Database& _db;
-    detail::conn& _conn;
+    // A share in the connection, as a Connection holds, so that the connection stays this thread's
+    // until the transaction ends: the Connection it was begun from can be gone well before then,
+    // as in `auto tx = db.conn().begin_immediate();`.
+    std::shared_ptr<detail::conn> _conn;
     // Engaged exactly while this holds the Database's _write_lock
     std::optional<SQLite::Transaction> _tx;
     std::chrono::steady_clock::time_point _requested, _acquired;
 
     friend class Connection;
     ImmediateTransaction(
-            Database& db, detail::conn& conn, std::optional<std::chrono::milliseconds> timeout);
+            Database& db,
+            std::shared_ptr<detail::conn> conn,
+            std::optional<std::chrono::milliseconds> timeout);
 
     void finish();
 
