@@ -15,11 +15,13 @@
 
 #include <algorithm>
 #include <atomic>
+#include <chrono>
 #include <cstdint>
 #include <fstream>
 #include <mutex>
 #include <session/sqlite.hpp>
 #include <stdexcept>
+#include <utility>
 
 #include "conn.hpp"
 
@@ -423,6 +425,10 @@ Connection Database::get_or_make_conn(std::thread::id tid, int extra_open_flags)
     if (_post_open)
         _post_open(c);
 
+    // After post_open, so that it can still set the threshold with PRAGMA wal_autocheckpoint.
+    if (_wal)
+        conn->install_wal_hook();
+
     _conn_in_use.emplace_back(tid, std::move(conn));
 
     return c;
@@ -569,6 +575,140 @@ Connection Database::conn() {
 
 Database::~Database() {
     assert(_conn_in_use.empty());
+}
+
+bool detail::fifo_lock::lock_until(std::chrono::steady_clock::time_point deadline) {
+    std::unique_lock lock{_mutex};
+    if (!_held && _queue.empty()) {
+        _held = true;
+        _owner = std::this_thread::get_id();
+        return true;
+    }
+    const auto ticket = _next_ticket++;
+    _queue.push_back(ticket);
+    if (_cv.wait_until(lock, deadline, [&] { return !_held && _queue.front() == ticket; })) {
+        _queue.pop_front();
+        _held = true;
+        _owner = std::this_thread::get_id();
+        return true;
+    }
+    // Giving up a place at the front can let the next in line go, if the lock is free.
+    const bool was_front = _queue.front() == ticket;
+    _queue.erase(std::find(_queue.begin(), _queue.end(), ticket));
+    lock.unlock();
+    if (was_front)
+        _cv.notify_all();
+    return false;
+}
+
+void detail::fifo_lock::unlock() {
+    bool waiters;
+    {
+        std::lock_guard lock{_mutex};
+        _held = false;
+        _owner = std::thread::id{};
+        waiters = !_queue.empty();
+    }
+    if (waiters)
+        _cv.notify_all();
+}
+
+bool detail::fifo_lock::held_by_this_thread() {
+    std::lock_guard lock{_mutex};
+    return _held && _owner == std::this_thread::get_id();
+}
+
+ImmediateTransaction::ImmediateTransaction(
+        Database& db, detail::conn& conn, std::optional<std::chrono::milliseconds> timeout) :
+        _db{db}, _conn{conn} {
+    auto& sql = conn.sql;
+    if (db._write_lock.held_by_this_thread())
+        throw SQLite::Exception{
+                "begin_immediate() would deadlock: this thread already holds the database's "
+                "write lock in another begin_immediate() transaction",
+                SQLITE_MISUSE};
+
+    const auto budget = timeout ? std::max(*timeout, 0ms) : db._busy_timeout;
+    _requested = std::chrono::steady_clock::now();
+    const auto deadline = _requested + budget;
+    if (!db._write_lock.lock_until(deadline))
+        throw SQLite::Exception{"database is locked", SQLITE_BUSY};
+
+    // The budget bounds the whole call, so BEGIN's busy handler gets only what waiting for
+    // _write_lock left of it, and the connection has its usual busy timeout back afterwards.  A
+    // busy timeout of 0 means not waiting at all, so what is left of any other budget is never
+    // less than 1ms.
+    const int usual = static_cast<int>(db._busy_timeout.count());
+    int left = 0;
+    if (budget > 0ms)
+        left = std::clamp(
+                static_cast<int>(std::chrono::ceil<std::chrono::milliseconds>(
+                                         deadline - std::chrono::steady_clock::now())
+                                         .count()),
+                1,
+                static_cast<int>(budget.count()));
+    auto* handle = sql.getHandle();
+    if (left != usual)
+        sqlite3_busy_timeout(handle, left);
+    try {
+        _tx.emplace(sql, SQLite::TransactionBehavior::IMMEDIATE);
+    } catch (...) {
+        if (left != usual)
+            sqlite3_busy_timeout(handle, usual);
+        db._write_lock.unlock();
+        throw;
+    }
+    if (left != usual)
+        sqlite3_busy_timeout(handle, usual);
+    conn.in_immediate = true;
+    _acquired = std::chrono::steady_clock::now();
+}
+
+ImmediateTransaction::~ImmediateTransaction() {
+    if (_tx)
+        finish();
+}
+
+void ImmediateTransaction::finish() {
+    _tx.reset();
+    const auto released = std::chrono::steady_clock::now();
+    _conn.in_immediate = false;
+    const bool checkpoint = std::exchange(_conn.checkpoint_due, false);
+    _db._write_lock.unlock();
+    // The checkpoint the COMMIT would have run (see detail::conn::install_wal_hook)
+    if (checkpoint)
+        sqlite3_wal_checkpoint_v2(
+                _conn.sql.getHandle(), nullptr, SQLITE_CHECKPOINT_PASSIVE, nullptr, nullptr);
+    if (_db._write_lock_observer && released - _requested >= _db._write_lock_observer_threshold)
+        _db._write_lock_observer(_acquired - _requested, released - _acquired);
+}
+
+void Database::set_write_lock_observer(
+        std::chrono::nanoseconds threshold,
+        std::function<void(std::chrono::nanoseconds, std::chrono::nanoseconds)> observer) {
+    _write_lock_observer_threshold = threshold;
+    _write_lock_observer = std::move(observer);
+}
+
+void ImmediateTransaction::commit() {
+    if (!_tx)
+        throw SQLite::Exception{"Transaction already committed or rolled back."};
+    _tx->commit();
+    finish();
+}
+
+void ImmediateTransaction::rollback() {
+    if (!_tx)
+        throw SQLite::Exception{"Transaction already committed or rolled back."};
+    // SQLite::Transaction does not record a rollback, so finish() destroying it issues a second
+    // ROLLBACK, which fails harmlessly (and silently).  Keeping it around instead would leave that
+    // ROLLBACK for later, when this connection could be in some other transaction.
+    _tx->rollback();
+    finish();
+}
+
+ImmediateTransaction Connection::begin_immediate(std::optional<std::chrono::milliseconds> timeout) {
+    return ImmediateTransaction{db, *_conn, timeout};
 }
 
 StatementWrapper Connection::prepared_st(std::string_view query) {

@@ -36,7 +36,24 @@ class conn {
 
     void statement_finished(std::unique_ptr<SQLite::Statement> st);
 
+    // Replaces sqlite's automatic checkpoint, which runs inside the COMMIT that takes the WAL past
+    // the connection's wal_autocheckpoint threshold, with one at that same threshold that, for a
+    // COMMIT in an ImmediateTransaction, waits until the transaction has released its Database's
+    // write lock, so that the writers queued behind it don't wait for the checkpoint too.
+    //
+    // Reads the threshold when called, so whatever sets it must run first; setting it afterwards
+    // reinstalls sqlite's own hook in place of this one.
+    void install_wal_hook();
+
+    // Set by an ImmediateTransaction while it holds the write lock with this connection.
+    bool in_immediate = false;
+    // Set when a COMMIT in that transaction has left a checkpoint for it to run.
+    bool checkpoint_due = false;
+
   private:
+    // In WAL frames; 0 for no automatic checkpoints.
+    int _wal_autocheckpoint = 0;
+
     std::thread::id _thread{std::this_thread::get_id()};
 
     // SQLiteCpp's statements are not thread-safe, so we prepare them thread-locally when needed

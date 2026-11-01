@@ -1,5 +1,7 @@
 #include "conn.hpp"
 
+#include <sqlite3.h>
+
 #include <session/sqlite.hpp>
 
 namespace session::sqlite::detail {
@@ -25,6 +27,24 @@ void conn::statement_finished(std::unique_ptr<SQLite::Statement> st) {
     if (!st)
         return;
     _st_cache[st->getQuery()].push_back(std::move(st));
+}
+
+void conn::install_wal_hook() {
+    _wal_autocheckpoint = sql.execAndGet("PRAGMA wal_autocheckpoint").getInt();
+    sqlite3_wal_hook(
+            sql.getHandle(),
+            [](void* self, sqlite3* db, const char* name, int frames) {
+                auto& c = *static_cast<conn*>(self);
+                if (c._wal_autocheckpoint > 0 && frames >= c._wal_autocheckpoint) {
+                    if (c.in_immediate)
+                        c.checkpoint_due = true;
+                    else
+                        sqlite3_wal_checkpoint_v2(
+                                db, name, SQLITE_CHECKPOINT_PASSIVE, nullptr, nullptr);
+                }
+                return SQLITE_OK;
+            },
+            this);
 }
 
 }  // namespace session::sqlite::detail

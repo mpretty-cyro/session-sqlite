@@ -6,8 +6,10 @@
 #include <chrono>
 #include <concepts>
 #include <condition_variable>
+#include <cstdint>
 #include <cstdlib>
 #include <cstring>
+#include <deque>
 #include <functional>
 #include <iterator>
 #include <mutex>
@@ -741,6 +743,24 @@ namespace detail {
     // Internal class holding a single sqlite connection.
     class conn;
 
+    // A lock that serves its waiters in the order they arrived.  A std::mutex lets the thread that
+    // releases it take it straight back if it asks again at once, which a thread doing a series
+    // of transactions always does, ahead of a waiter that has only just been woken.
+    class fifo_lock {
+        std::mutex _mutex;
+        std::condition_variable _cv;
+        std::deque<uint64_t> _queue;
+        uint64_t _next_ticket = 0;
+        bool _held = false;
+        std::thread::id _owner;
+
+      public:
+        // Waits for the lock until `deadline`; returns false if it is not this caller's by then.
+        bool lock_until(std::chrono::steady_clock::time_point deadline);
+        void unlock();
+        bool held_by_this_thread();
+    };
+
 }  // namespace detail
 
 template <typename T>
@@ -858,6 +878,13 @@ class Database {
     Connection get_or_make_conn(std::thread::id tid, int extra_open_flags = 0);
     std::mutex _conn_mutex;
 
+    // Held by an ImmediateTransaction from before its BEGIN until SQLite has released the write
+    // lock, so that this process's begin_immediate() callers wait here, where the lock is handed
+    // to the next in line as soon as it is free, rather than in SQLite's busy handler, which
+    // sleeps and polls.
+    detail::fifo_lock _write_lock;
+    std::function<void(std::chrono::nanoseconds, std::chrono::nanoseconds)> _write_lock_observer;
+    std::chrono::nanoseconds _write_lock_observer_threshold{};
     // Opens and sets up a new connection, outside the pool and without `_post_open`.  Touches no
     // pool state, so needs no pool lock - but it reads `_key`, whose buffer unlocks and relocks its
     // memory around each read with a plain counter, so two opens at once take `_key_mutex`.
@@ -884,6 +911,7 @@ class Database {
     bool keep_idle() const;
 
     friend class Connection;
+    friend class ImmediateTransaction;
     // Called by Connection after releasing a backend connection to have us rescan for any
     // now-unused connections in _conn_in_use.
     void conn_returned();
@@ -984,6 +1012,15 @@ class Database {
     // so that the given limit now applies.
     void set_max_idle_conns(int max_idle);
 
+    // Sets a function to be told, as each begin_immediate() transaction ends whose wait for the
+    // write lock (in this process's queue and in SQLite's busy handler together) and time holding
+    // it add up to at least `threshold`, how long it spent on each, for finding write contention.
+    // It is called from the thread that held the lock, after releasing it, and must not throw.
+    // This must be set before the first begin_immediate(): it is not synchronized with them.
+    void set_write_lock_observer(
+            std::chrono::nanoseconds threshold,
+            std::function<void(std::chrono::nanoseconds waited, std::chrono::nanoseconds held)>
+                    observer);
     // What `suspend()` managed within its wait.
     struct suspend_result {
         // Every connection was closed, so the process holds no lock on the database files.  False
@@ -1176,6 +1213,35 @@ class IterableStatementWrapper : StatementWrapper {
     iterator end() { return iterator{*this, true}; }
 };
 
+/// The transaction returned by Connection::begin_immediate(), used like a SQLite::Transaction:
+/// commit() keeps the changes, and destroying it without committing rolls them back.
+///
+/// It also holds its Database's in-process write lock, and releases it only once SQLite has
+/// released the write lock: after a commit() or rollback() succeeds, or when destroyed.  A commit()
+/// that throws leaves the transaction open, so both locks stay held until it is destroyed.
+class ImmediateTransaction {
+    Database& _db;
+    detail::conn& _conn;
+    // Engaged exactly while this holds the Database's _write_lock
+    std::optional<SQLite::Transaction> _tx;
+    std::chrono::steady_clock::time_point _requested, _acquired;
+
+    friend class Connection;
+    ImmediateTransaction(
+            Database& db, detail::conn& conn, std::optional<std::chrono::milliseconds> timeout);
+
+    void finish();
+
+  public:
+    ImmediateTransaction(const ImmediateTransaction&) = delete;
+    ImmediateTransaction& operator=(const ImmediateTransaction&) = delete;
+
+    ~ImmediateTransaction();
+
+    void commit();
+    void rollback();
+};
+
 // This is the per-thread shared connection class returned by Database::conn().  While held this
 // connection is reserved for the single thread to which it was requested, and must not be used in
 // any other thread.
@@ -1198,6 +1264,38 @@ class Connection {
 
     // The SQLiteCpp instance to actually interact with the sqlite3 db.
     SQLite::Database& sql;
+
+    /// Begins a deferred transaction, which takes no lock until a statement in it needs one.  For a
+    /// transaction that only reads: one that may write wants `begin_immediate()`.
+    [[nodiscard]] SQLite::Transaction begin() {
+        return SQLite::Transaction{sql, SQLite::TransactionBehavior::DEFERRED};
+    }
+
+    /// Begins a transaction that takes the database's write lock at BEGIN, which is what a
+    /// transaction that may write wants - even one whose first statement is a write, so that being
+    /// safe does not hang on statement order.
+    ///
+    /// In WAL mode a deferred transaction reads from a snapshot and asks for the write lock only at
+    /// its first write.  If another connection - another process, or another connection in this
+    /// one - has committed since that snapshot was taken, the write then fails at once with
+    /// SQLITE_BUSY, and the busy timeout does not help: no amount of waiting makes a stale snapshot
+    /// current.  Taking the lock at BEGIN takes the snapshot with it, so contention becomes a wait
+    /// for the lock instead.
+    ///
+    /// begin_immediate() callers on the same Database get the lock in the order they asked for it.
+    /// Writes made any other way, in this process or another, don't queue with them, and are
+    /// waited out with SQLite's busy handler.  `timeout`, or the Database's busy timeout if it is
+    /// not given, bounds the whole wait, after which this throws a SQLite::Exception with
+    /// SQLITE_BUSY; 0 takes the lock only if it is free now.  It throws one with SQLITE_MISUSE if
+    /// this thread already has a begin_immediate() transaction open on this Database.
+    ///
+    /// The lock keeps every other writer on the file waiting until the transaction ends, so what
+    /// runs inside should be the writes and the reads that decide them.  Readers are not blocked.
+    ///
+    /// Set `PRAGMA wal_autocheckpoint`, if at all, from `post_open`: set on a connection later, it
+    /// makes the automatic checkpoint run inside COMMIT, with every queued writer waiting for it.
+    [[nodiscard]] ImmediateTransaction begin_immediate(
+            std::optional<std::chrono::milliseconds> timeout = std::nullopt);
 
     /// Prepares a query, caching it, and returns a wrapper that automatically resets the
     /// prepared statement on destruction.
@@ -1225,6 +1323,28 @@ class Connection {
     template <typename... T>
     int prepared_exec(std::string_view query, const T&... bind) {
         return exec_query(prepared_st(query), bind...);
+    }
+
+    /// prepared_exec() in a begin_immediate() transaction of its own, for a write that is a single
+    /// statement, so that it waits for the write lock the way begin_immediate() does rather than in
+    /// the busy handler alone.  Returns the number of rows changed.  Inside a begin_immediate()
+    /// transaction use prepared_exec() instead: this would throw, as begin_immediate() does.
+    template <typename... T>
+    int prepared_exec_immediate(std::string_view query, const T&... bind) {
+        auto tx = begin_immediate();
+        int changes = prepared_exec(query, bind...);
+        tx.commit();
+        return changes;
+    }
+
+    /// The same, waiting at most `timeout` for the write lock, as begin_immediate(timeout) does.
+    template <typename... T>
+    int prepared_exec_immediate(
+            std::chrono::milliseconds timeout, std::string_view query, const T&... bind) {
+        auto tx = begin_immediate(timeout);
+        int changes = prepared_exec(query, bind...);
+        tx.commit();
+        return changes;
     }
 
     /// Prepares (with caching) a query that returns a single row (with optional bind
