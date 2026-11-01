@@ -751,14 +751,22 @@ namespace detail {
         std::condition_variable _cv;
         std::deque<uint64_t> _queue;
         uint64_t _next_ticket = 0;
+        // Tickets below this were waiting when cancel_waiters() was last called.
+        uint64_t _cancelled_below = 0;
         bool _held = false;
         std::thread::id _owner;
 
       public:
-        // Waits for the lock until `deadline`; returns false if it is not this caller's by then.
-        bool lock_until(std::chrono::steady_clock::time_point deadline);
+        enum class result { acquired, timed_out, cancelled };
+
+        // Waits for the lock until `deadline`, or until cancel_waiters() is called.
+        result lock_until(std::chrono::steady_clock::time_point deadline);
         void unlock();
         bool held_by_this_thread();
+
+        // Makes every lock_until() waiting now give up, returning `cancelled`.  One that begins
+        // waiting afterwards waits as usual.  The holder keeps the lock.
+        void cancel_waiters();
     };
 
 }  // namespace detail
@@ -1041,7 +1049,11 @@ class Database {
     // Idle connections close at once, and this waits up to `wait` for the held ones to be returned,
     // each closing as it is.  With `interrupt`, for when there is no time left to wait, the
     // statements running on held connections are interrupted first: an interrupted statement
-    // throws on its own thread, where the transaction's RAII rollback runs.
+    // throws on its own thread, where the transaction's RAII rollback runs.  So are the
+    // `begin_immediate()` calls waiting for this database's write lock, which run no statement
+    // until they have it: each throws a SQLite::Exception with SQLITE_INTERRUPT rather than
+    // waiting out its timeout to begin a transaction this suspend would then wait for.  As with a
+    // statement, it is the calls under way that are interrupted, not later ones.
     //
     // With `checkpoint`, once every connection is closed one is opened just long enough to
     // checkpoint and truncate the WAL, within what remains of `wait`.  Closing the last connection
@@ -1287,7 +1299,8 @@ class Connection {
     /// waited out with SQLite's busy handler.  `timeout`, or the Database's busy timeout if it is
     /// not given, bounds the whole wait, after which this throws a SQLite::Exception with
     /// SQLITE_BUSY; 0 takes the lock only if it is free now.  It throws one with SQLITE_MISUSE if
-    /// this thread already has a begin_immediate() transaction open on this Database.
+    /// this thread already has a begin_immediate() transaction open on this Database, and one with
+    /// SQLITE_INTERRUPT if `Database::suspend()` with `interrupt` is called while it waits.
     ///
     /// The lock keeps every other writer on the file waiting until the transaction ends, so what
     /// runs inside should be the writes and the reads that decide them.  Readers are not blocked.

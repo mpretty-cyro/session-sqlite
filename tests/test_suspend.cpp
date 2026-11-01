@@ -417,3 +417,235 @@ TEST_CASE(
     stop = true;
     held.join();
 }
+
+namespace {
+
+bool is_interrupt(const SQLite::Exception& e) {
+    return (e.getErrorCode() & 0xff) == SQLITE_INTERRUPT;
+}
+
+// Holds the write lock in a begin_immediate() transaction on a thread of its own, inserting `x`,
+// until released; then commits.
+struct ImmediateHolder {
+    Gate holding, release;
+    std::thread thread;
+    ImmediateHolder(Database& db, int x) :
+            thread{[&db, x, this] {
+                auto c = db.conn();
+                auto tx = c.begin_immediate();
+                c.prepared_exec("INSERT INTO foo VALUES (?)", x);
+                holding.count_down();
+                release.wait();
+                tx.commit();
+            }} {
+        holding.wait();
+    }
+    void finish() {
+        release.count_down();
+        if (thread.joinable())
+            thread.join();
+    }
+    ~ImmediateHolder() { finish(); }
+};
+
+}  // namespace
+
+TEST_CASE("a begin_immediate waiter carries on across a suspend", "[suspend][transactions]") {
+    TempPath tmp;
+    Database db{tmp.path};
+    make_table(db);
+
+    ImmediateHolder holder{db, 1};
+    // Holds its connection from before the suspend, so it keeps it, and waits in the queue for the
+    // write lock with a timeout far longer than any wait below.
+    Gate queuing;
+    std::atomic<bool> acquired{false}, committed{false};
+    std::thread waiter{[&] {
+        auto c = db.conn();
+        queuing.count_down();
+        auto tx = c.begin_immediate(30s);
+        acquired = true;
+        c.prepared_exec("INSERT INTO foo VALUES (2)");
+        tx.commit();
+        committed = true;
+    }};
+    queuing.wait();
+    std::this_thread::sleep_for(50ms);
+
+    SECTION("resumed before the suspend could close its connection") {
+        CHECK_FALSE(db.suspend(100ms).closed);
+        CHECK_FALSE(acquired);
+        db.resume();
+        holder.finish();
+        waiter.join();
+    }
+    SECTION("finishing before the suspend closes its connection") {
+        Database::suspend_result result;
+        std::thread suspender{[&] { result = db.suspend(10s); }};
+        std::this_thread::sleep_for(50ms);
+        CHECK_FALSE(acquired);
+        // The holder's release hands the lock straight to the queued waiter, which can finish
+        // what it started and so let the suspend close its connection.
+        holder.finish();
+        waiter.join();
+        suspender.join();
+        CHECK(result.closed);
+        CHECK(db.open_connections() == 0);
+        db.resume();
+    }
+
+    CHECK(committed);
+    CHECK(db.conn().prepared_get<int>("SELECT count(*) FROM foo WHERE x IN (1, 2)") == 2);
+    // The lock is free for whoever comes next.
+    CHECK(db.conn().prepared_exec_immediate(0ms, "INSERT INTO foo VALUES (3)") == 1);
+}
+
+TEST_CASE(
+        "suspend with interrupt makes begin_immediate waiters give up, not the holder",
+        "[suspend][transactions]") {
+    TempPath tmp;
+    Database db{tmp.path};
+    make_table(db);
+    std::atomic<int> observed{0};
+    db.set_write_lock_observer(0ns, [&](auto, auto) { observed++; });
+
+    // Not running a statement, so the interrupt has nothing of the holder's to stop.
+    ImmediateHolder holder{db, 1};
+    // Counted here and checked on the main thread: a failed assertion must not throw out of a
+    // thread.
+    std::atomic<int> interrupted{0}, not_interrupted{0};
+    Gate queuing, waiting, suspended, later_queuing;
+    auto expect_interrupt = [&](auto&& f) {
+        try {
+            f();
+        } catch (const SQLite::Exception& e) {
+            if (is_interrupt(e)) {
+                interrupted++;
+                return;
+            }
+        }
+        not_interrupted++;
+    };
+    std::thread waiter{[&] {
+        auto c = db.conn();
+        queuing.count_down();
+        expect_interrupt([&] {
+            auto tx = c.begin_immediate(30s);
+            c.prepared_exec("INSERT INTO foo VALUES (2)");
+            tx.commit();
+        });
+    }};
+    queuing.wait();
+    std::thread exec_waiter{[&] {
+        auto c = db.conn();
+        waiting.count_down();
+        expect_interrupt([&] { c.prepared_exec_immediate(30s, "INSERT INTO foo VALUES (3)"); });
+    }};
+    waiting.wait();
+    // Has its connection from before the suspend, but asks for the lock only after the interrupt,
+    // and so waits for it as usual.
+    std::atomic<bool> later_committed{false};
+    std::thread later{[&] {
+        auto c = db.conn();
+        later_queuing.count_down();
+        suspended.wait();
+        auto tx = c.begin_immediate(30s);
+        c.prepared_exec("INSERT INTO foo VALUES (4)");
+        tx.commit();
+        later_committed = true;
+    }};
+    later_queuing.wait();
+    std::this_thread::sleep_for(50ms);
+
+    auto start = std::chrono::steady_clock::now();
+    CHECK_FALSE(db.suspend(200ms, true).closed);
+    waiter.join();
+    exec_waiter.join();
+    CHECK(std::chrono::steady_clock::now() - start < 5s);
+    CHECK(interrupted == 2);
+    CHECK(not_interrupted == 0);
+
+    suspended.count_down();
+    std::this_thread::sleep_for(50ms);
+    CHECK_FALSE(later_committed);
+    // The holder still has the lock, and commits what it wrote.
+    holder.finish();
+    later.join();
+    CHECK(later_committed);
+    CHECK(db.open_connections() == 0);
+    db.resume();
+
+    CHECK(db.conn().prepared_get<std::string>(
+                  "SELECT group_concat(x) FROM (SELECT x FROM foo ORDER BY x)") == "1,4,42");
+    // Transactions that ended are reported, not calls that gave up before taking the lock.
+    CHECK(observed == 2);
+}
+
+TEST_CASE(
+        "a held thread's prepared_exec_immediate waits for the resume",
+        "[suspend][hold][transactions]") {
+    TempPath tmp;
+    Database db{tmp.path};
+    make_table(db);
+    db.on_hold([](auto) {});
+
+    REQUIRE(db.suspend(0ms).closed);
+    std::atomic<bool> written{false};
+    std::thread held{[&] {
+        db.hold_while_suspended(std::this_thread::get_id());
+        db.conn().prepared_exec_immediate("INSERT INTO foo VALUES (1)");
+        written = true;
+        db.stop_holding(std::this_thread::get_id());
+    }};
+    std::this_thread::sleep_for(100ms);
+    CHECK_FALSE(written);
+    CHECK(db.open_connections() == 0);
+    db.resume();
+    held.join();
+    CHECK(written);
+    CHECK(db.conn().prepared_get<int>("SELECT count(*) FROM foo") == 2);
+}
+
+TEST_CASE(
+        "begin_immediate's deferred checkpoint runs before a suspend's own",
+        "[suspend][transactions]") {
+    // The checkpoint a COMMIT leaves for after the write lock is released runs on the connection
+    // its thread still holds, so it ends before that connection is returned -- and the suspend's
+    // checkpoint opens only once every connection is closed.
+    TempPath tmp;
+    constexpr int threshold = 50;
+    Database db{tmp.path, post_open{[](Connection& c) {
+                    c.sql.exec("PRAGMA wal_autocheckpoint = " + std::to_string(threshold));
+                }}};
+    make_table(db);
+    Outsider other{tmp.path};
+    other.touch();
+    auto wal = std::filesystem::path{tmp.path.string() + "-wal"};
+
+    Gate holding, release;
+    std::thread holder{[&] {
+        auto c = db.conn();
+        auto tx = c.begin_immediate();
+        const auto blob = std::string(3000, 'x');
+        for (int i = 0; i < 2 * threshold; i++)
+            c.prepared_exec("INSERT INTO foo VALUES (?)", blob);
+        holding.count_down();
+        release.wait();
+        tx.commit();
+    }};
+    holding.wait();
+
+    Database::suspend_result result;
+    std::thread suspender{[&] { result = db.suspend(10s, false, true); }};
+    std::this_thread::sleep_for(50ms);
+    release.count_down();
+    holder.join();
+    suspender.join();
+
+    CHECK(result.closed);
+    CHECK(result.checkpointed);
+    CHECK(std::filesystem::file_size(wal) == 0);
+    CHECK(db.open_connections() == 0);
+    db.resume();
+    CHECK(db.conn().prepared_get<int>("SELECT count(*) FROM foo") == 2 * threshold + 1);
+}

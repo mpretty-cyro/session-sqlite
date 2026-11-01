@@ -298,9 +298,15 @@ Database::suspend_result Database::suspend(
 
     if (_conn_unused.size() > (_memory ? 1 : 0))
         _conn_unused.resize(_memory ? 1 : 0);
-    if (interrupt)
+    if (interrupt) {
         for (auto& [th, c] : _conn_in_use)
             sqlite3_interrupt(c->sql.getHandle());
+        // begin_immediate() callers wait for the write lock outside SQLite, where sqlite3_interrupt
+        // does not reach them.  Each holds a connection, and would otherwise go on to begin a
+        // transaction -- not interrupted, having started after the interrupt -- that this would
+        // then wait for.
+        _write_lock.cancel_waiters();
+    }
 
     suspend_result result;
     result.closed = _conn_cv.wait_until(lock, deadline, [this] {
@@ -577,20 +583,26 @@ Database::~Database() {
     assert(_conn_in_use.empty());
 }
 
-bool detail::fifo_lock::lock_until(std::chrono::steady_clock::time_point deadline) {
+detail::fifo_lock::result detail::fifo_lock::lock_until(
+        std::chrono::steady_clock::time_point deadline) {
     std::unique_lock lock{_mutex};
     if (!_held && _queue.empty()) {
         _held = true;
         _owner = std::this_thread::get_id();
-        return true;
+        return result::acquired;
     }
     const auto ticket = _next_ticket++;
     _queue.push_back(ticket);
-    if (_cv.wait_until(lock, deadline, [&] { return !_held && _queue.front() == ticket; })) {
+    _cv.wait_until(lock, deadline, [&] {
+        return ticket < _cancelled_below || (!_held && _queue.front() == ticket);
+    });
+    // Cancelled first: a cancelled waiter gives the lock up even if it is free and its turn.
+    const bool cancelled = ticket < _cancelled_below;
+    if (!cancelled && !_held && _queue.front() == ticket) {
         _queue.pop_front();
         _held = true;
         _owner = std::this_thread::get_id();
-        return true;
+        return result::acquired;
     }
     // Giving up a place at the front can let the next in line go, if the lock is free.
     const bool was_front = _queue.front() == ticket;
@@ -598,7 +610,18 @@ bool detail::fifo_lock::lock_until(std::chrono::steady_clock::time_point deadlin
     lock.unlock();
     if (was_front)
         _cv.notify_all();
-    return false;
+    return cancelled ? result::cancelled : result::timed_out;
+}
+
+void detail::fifo_lock::cancel_waiters() {
+    bool waiters;
+    {
+        std::lock_guard lock{_mutex};
+        _cancelled_below = _next_ticket;
+        waiters = !_queue.empty();
+    }
+    if (waiters)
+        _cv.notify_all();
 }
 
 void detail::fifo_lock::unlock() {
@@ -631,8 +654,13 @@ ImmediateTransaction::ImmediateTransaction(
     const auto budget = timeout ? std::max(*timeout, 0ms) : db._busy_timeout;
     _requested = std::chrono::steady_clock::now();
     const auto deadline = _requested + budget;
-    if (!db._write_lock.lock_until(deadline))
-        throw SQLite::Exception{"database is locked", SQLITE_BUSY};
+    switch (db._write_lock.lock_until(deadline)) {
+        case detail::fifo_lock::result::acquired: break;
+        case detail::fifo_lock::result::timed_out:
+            throw SQLite::Exception{"database is locked", SQLITE_BUSY};
+        case detail::fifo_lock::result::cancelled:
+            throw SQLite::Exception{"interrupted", SQLITE_INTERRUPT};
+    }
 
     // The budget bounds the whole call, so BEGIN's busy handler gets only what waiting for
     // _write_lock left of it, and the connection has its usual busy timeout back afterwards.  A
