@@ -9,6 +9,7 @@
 #include <session/sqlite.hpp>
 #include <string>
 #include <thread>
+#include <utility>
 #include <vector>
 
 using namespace session::sqlite;
@@ -227,7 +228,10 @@ TEST_CASE(
     });
 
     // Neither waits nor holds for long enough to be reported
-    db.conn().begin_immediate().commit();
+    {
+        auto c = db.conn();
+        c.begin_immediate().commit();
+    }
 
     std::promise<void> holding;
     std::thread holder{[&] {
@@ -591,53 +595,16 @@ TEST_CASE("the WAL is still checkpointed at the connection's threshold", "[trans
     }
 }
 
-TEST_CASE(
-        "an ImmediateTransaction keeps its connection from another thread after the Connection "
-        "it was begun from is gone",
-        "[transactions]") {
-    TempPath tmp;
-    Database db{tmp.path};
-    db.conn().sql.exec("CREATE TABLE foo (x INTEGER)");
-
-    auto tx = db.conn().begin_immediate();
-
-    // The transaction's connection is still this thread's, rather than idle and free to be taken
-    bool other_in_transaction = true;
-    std::thread other{[&] {
-        auto c = db.conn();
-        other_in_transaction = !sqlite3_get_autocommit(c.sql.getHandle());
-    }};
-    other.join();
-    CHECK_FALSE(other_in_transaction);
-
-    auto c = db.conn();
-    CHECK_FALSE(sqlite3_get_autocommit(c.sql.getHandle()));
-    c.prepared_exec("INSERT INTO foo VALUES (1)");
-    tx.commit();
-    CHECK(sqlite3_get_autocommit(c.sql.getHandle()));
-    CHECK(c.prepared_get<int>("SELECT count(*) FROM foo") == 1);
-}
-
-TEST_CASE(
-        "an ImmediateTransaction keeps its connection open after the Connection it was begun from "
-        "is gone",
-        "[transactions]") {
-    TempPath tmp;
-    Database db{tmp.path};
-    db.conn().sql.exec("CREATE TABLE foo (x INTEGER)");
-    // Every connection is closed as soon as nothing is using it
-    db.set_max_idle_conns(0);
-
-    {
-        auto tx = db.conn().begin_immediate();
-        db.conn().prepared_exec("INSERT INTO foo VALUES (1)");
-        tx.commit();
-    }
-    {
-        auto tx = db.conn().begin_immediate();
-        db.conn().prepared_exec("INSERT INTO foo VALUES (2)");
-        // Rolled back by its destructor
-    }
-    CHECK(db.conn().prepared_get<int>("SELECT count(*) FROM foo") == 1);
-    CHECK(can_write_elsewhere(tmp.path));
-}
+// A transaction begun from a temporary Connection would outlive the lease that keeps its connection
+// this thread's, so it doesn't compile.
+template <typename C>
+concept can_begin = requires(C&& c) { std::forward<C>(c).begin(); };
+template <typename C>
+concept can_begin_immediate = requires(C&& c) {
+    std::forward<C>(c).begin_immediate();
+    std::forward<C>(c).begin_immediate(1s);
+};
+static_assert(can_begin<Connection&>);
+static_assert(can_begin_immediate<Connection&>);
+static_assert(!can_begin<Connection>);
+static_assert(!can_begin_immediate<Connection>);

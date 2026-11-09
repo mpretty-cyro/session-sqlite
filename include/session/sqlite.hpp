@@ -1123,19 +1123,14 @@ class IterableStatementWrapper : StatementWrapper {
 /// that throws leaves the transaction open, so both locks stay held until it is destroyed.
 class ImmediateTransaction {
     Database& _db;
-    // A share in the connection, as a Connection holds, so that the connection stays this thread's
-    // until the transaction ends: the Connection it was begun from can be gone well before then,
-    // as in `auto tx = db.conn().begin_immediate();`.
-    std::shared_ptr<detail::conn> _conn;
+    detail::conn& _conn;
     // Engaged exactly while this holds the Database's _write_lock
     std::optional<SQLite::Transaction> _tx;
     std::chrono::steady_clock::time_point _requested, _acquired;
 
     friend class Connection;
     ImmediateTransaction(
-            Database& db,
-            std::shared_ptr<detail::conn> conn,
-            std::optional<std::chrono::milliseconds> timeout);
+            Database& db, detail::conn& conn, std::optional<std::chrono::milliseconds> timeout);
 
     void finish();
 
@@ -1174,9 +1169,14 @@ class Connection {
 
     /// Begins a deferred transaction, which takes no lock until a statement in it needs one.  For a
     /// transaction that only reads: one that may write wants `begin_immediate()`.
-    [[nodiscard]] SQLite::Transaction begin() {
+    [[nodiscard]] SQLite::Transaction begin() & {
         return SQLite::Transaction{sql, SQLite::TransactionBehavior::DEFERRED};
     }
+    /// Not on a temporary, as in `db.conn().begin()`: the transaction must not outlive the
+    /// Connection it was begun from, which is what keeps the connection this thread's.  Once the
+    /// last Connection on it is gone it is idle, and another thread's conn() can take it, still
+    /// inside this transaction, or the pool can close it.
+    SQLite::Transaction begin() && = delete;
 
     /// Begins a transaction that takes the database's write lock at BEGIN, which is what a
     /// transaction that may write wants - even one whose first statement is a write, so that being
@@ -1201,8 +1201,12 @@ class Connection {
     ///
     /// Set `PRAGMA wal_autocheckpoint`, if at all, from `post_open`: set on a connection later, it
     /// makes the automatic checkpoint run inside COMMIT, with every queued writer waiting for it.
+    ///
+    /// Not on a temporary, as in `db.conn().begin_immediate()`, for the reason begin() isn't.
     [[nodiscard]] ImmediateTransaction begin_immediate(
-            std::optional<std::chrono::milliseconds> timeout = std::nullopt);
+            std::optional<std::chrono::milliseconds> timeout = std::nullopt) &;
+    ImmediateTransaction begin_immediate(
+            std::optional<std::chrono::milliseconds> timeout = std::nullopt) && = delete;
 
     /// Prepares a query, caching it, and returns a wrapper that automatically resets the
     /// prepared statement on destruction.
