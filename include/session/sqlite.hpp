@@ -1210,24 +1210,37 @@ class Connection {
 
     /// Prepares a query, caching it, and returns a wrapper that automatically resets the
     /// prepared statement on destruction.
-    StatementWrapper prepared_st(std::string_view query);
+    ///
+    /// This, prepared_bind() and prepared_results() are not available on a temporary, for the
+    /// reason begin() isn't: the statement belongs to the connection.  `for (auto x :
+    /// db.conn().prepared_results<int>(...))` would step through rows on a connection that the
+    /// pool already treats as idle, because the temporary Connection is gone before the loop runs.
+    StatementWrapper prepared_st(std::string_view query) &;
+    StatementWrapper prepared_st(std::string_view query) && = delete;
 
     /// Prepares (with caching) and binds a query, returning the active statement handle.  Like
     /// `prepared_st` the wrapper resets the prepared statement on destruction.
     template <typename... T>
-    StatementWrapper prepared_bind(std::string_view query, const T&... bind) {
+    StatementWrapper prepared_bind(std::string_view query, const T&... bind) & {
         auto st = prepared_st(query);
         bind_oneshot(st, bind...);
         return st;
     }
+    template <typename... T>
+    StatementWrapper prepared_bind(std::string_view query, const T&... bind) && = delete;
 
     /// Prepares (with caching), binds parameters, then returns an object that lets you iterate
     /// through results where each row is a T or tuple<T...>:
     template <typename... T, typename... Bind>
         requires(sizeof...(T) != 0)
-    IterableStatementWrapper<T...> prepared_results(std::string_view query, const Bind&... bind) {
+    IterableStatementWrapper<T...> prepared_results(
+            std::string_view query, const Bind&... bind) & {
         return IterableStatementWrapper<T...>{prepared_bind(query, bind...)};
     }
+    template <typename... T, typename... Bind>
+        requires(sizeof...(T) != 0)
+    IterableStatementWrapper<T...> prepared_results(
+            std::string_view query, const Bind&... bind) && = delete;
 
     /// Prepares (with caching) a query that returns no rows and then executes it, optionally
     /// binding the given parameters when executing.  Throws if the query fails or returns any rows.

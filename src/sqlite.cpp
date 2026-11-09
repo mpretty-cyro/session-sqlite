@@ -587,7 +587,7 @@ ImmediateTransaction Connection::begin_immediate(
     return ImmediateTransaction{db, *_conn, timeout};
 }
 
-StatementWrapper Connection::prepared_st(std::string_view query) {
+StatementWrapper Connection::prepared_st(std::string_view query) & {
     return _conn->prepared_st(query);
 }
 

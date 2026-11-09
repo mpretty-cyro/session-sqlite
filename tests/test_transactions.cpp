@@ -595,16 +595,32 @@ TEST_CASE("the WAL is still checkpointed at the connection's threshold", "[trans
     }
 }
 
-// A transaction begun from a temporary Connection would outlive the lease that keeps its connection
-// this thread's, so it doesn't compile.
+// A transaction or statement begun from a temporary Connection would outlive the lease that keeps
+// its connection this thread's, so it doesn't compile.  Each call is checked on its own: a concept
+// requiring them all would be unsatisfied on a temporary if any one of them were refused.
 template <typename C>
 concept can_begin = requires(C&& c) { std::forward<C>(c).begin(); };
 template <typename C>
-concept can_begin_immediate = requires(C&& c) {
-    std::forward<C>(c).begin_immediate();
-    std::forward<C>(c).begin_immediate(1s);
-};
-static_assert(can_begin<Connection&>);
-static_assert(can_begin_immediate<Connection&>);
-static_assert(!can_begin<Connection>);
-static_assert(!can_begin_immediate<Connection>);
+concept can_begin_immediate = requires(C&& c) { std::forward<C>(c).begin_immediate(); };
+template <typename C>
+concept can_begin_immediate_timeout = requires(C&& c) { std::forward<C>(c).begin_immediate(1s); };
+template <typename C>
+concept can_prepare_st = requires(C&& c) { std::forward<C>(c).prepared_st("SELECT 1"); };
+template <typename C>
+concept can_prepare_bind = requires(C&& c) { std::forward<C>(c).prepared_bind("SELECT ?", 1); };
+template <typename C>
+concept can_prepare_results =
+        requires(C&& c) { std::forward<C>(c).template prepared_results<int>("SELECT ?", 1); };
+
+static_assert(can_begin<Connection&> && !can_begin<Connection>);
+static_assert(can_begin_immediate<Connection&> && !can_begin_immediate<Connection>);
+static_assert(can_begin_immediate_timeout<Connection&> && !can_begin_immediate_timeout<Connection>);
+static_assert(can_prepare_st<Connection&> && !can_prepare_st<Connection>);
+static_assert(can_prepare_bind<Connection&> && !can_prepare_bind<Connection>);
+static_assert(can_prepare_results<Connection&> && !can_prepare_results<Connection>);
+
+// What returns a value rather than the statement is still fine on a temporary.
+static_assert(requires(Database& db) {
+    db.conn().prepared_get<int>("SELECT 1");
+    db.conn().prepared_exec("SELECT 1");
+});
