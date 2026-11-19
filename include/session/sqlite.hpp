@@ -3,6 +3,7 @@
 #include <SQLiteCpp/Database.h>
 #include <SQLiteCpp/SQLiteCpp.h>
 
+#include <atomic>
 #include <chrono>
 #include <concepts>
 #include <condition_variable>
@@ -24,6 +25,8 @@
 #include <vector>
 
 #include "secure_buffer.hpp"
+
+struct sqlite3;
 
 namespace session::sqlite {
 
@@ -752,12 +755,16 @@ namespace detail {
         std::deque<uint64_t> _queue;
         uint64_t _next_ticket = 0;
         bool _held = false;
+        bool _aborted = false;
         std::thread::id _owner;
 
       public:
-        // Waits for the lock until `deadline`; returns false if it is not this caller's by then.
+        // Waits for the lock until `deadline`; returns false if it is not this caller's by then, or
+        // once the lock has been aborted.
         bool lock_until(std::chrono::steady_clock::time_point deadline);
         void unlock();
+        // Makes every wait for the lock, current and future, give up at once.
+        void abort();
         bool held_by_this_thread();
     };
 
@@ -779,6 +786,40 @@ concept DatabaseBehaviourOption =
 
 template <typename T>
 concept DatabaseOption = DatabaseEncryptOption<T> || DatabaseBehaviourOption<T>;
+
+/// Interrupts a Database's SQL from any thread: safe to use while the Database is being destroyed,
+/// and harmless after, so it can be held by something racing the Database's owner.  Got from
+/// Database::interrupt_handle().
+class InterruptHandle {
+  public:
+    /// Interrupts every statement running on the Database's connections and refuses all of its
+    /// work from here on: a statement running now or started later fails with SQLITE_INTERRUPT,
+    /// rolling back the transaction it is in; conn() and unique_conn() throw the same; and a
+    /// begin_immediate() waiting for the write lock gives up.
+    ///
+    /// For when there is no time left to let work finish, such as an app about to be suspended
+    /// with a transaction open, which iOS kills.  Permanent: once interrupted, the Database is
+    /// only good for destroying.
+    void interrupt();
+
+    bool interrupted() const { return _interrupted.load(std::memory_order_acquire); }
+
+  private:
+    friend class Database;
+    friend class detail::conn;
+
+    // Guards _handles and _write_lock against the connections and the Database that own them
+    // going away while interrupt() reaches into them.
+    std::mutex _mutex;
+    std::vector<::sqlite3*> _handles;
+    detail::fifo_lock* _write_lock = nullptr;
+    std::atomic<bool> _interrupted{false};
+
+    void add(::sqlite3* handle);
+    void remove(::sqlite3* handle);
+    void attach(detail::fifo_lock& write_lock);
+    void detach();
+};
 
 /// Database connection managing class.  This class operates as a sort of thread-safe SQLite3
 /// connection pool where each thread gets its own connection as needed so that multiple threads do
@@ -835,6 +876,10 @@ concept DatabaseOption = DatabaseEncryptOption<T> || DatabaseBehaviourOption<T>;
 /// same time).
 class Database {
   private:
+    // First, so that it outlives every connection below: each one removes itself from it as it
+    // closes.
+    std::shared_ptr<InterruptHandle> _interrupt = std::make_shared<InterruptHandle>();
+
     // Various values needed to open a connection (determined during construction):
 
     // This holds the key or password in the form we need to pass to sqlite_key to set the
@@ -870,6 +915,8 @@ class Database {
     int _conn_max_idle = -1;
     Connection get_or_make_conn(std::thread::id tid, int extra_open_flags = 0);
     std::mutex _conn_mutex;
+    // Signalled whenever conn_returned() runs, for the destructor's wait for borrowed connections.
+    std::condition_variable _conn_returned_cv;
 
     // Held by an ImmediateTransaction from before its BEGIN until SQLite has released the write
     // lock, so that this process's begin_immediate() callers wait here, where the lock is handed
@@ -1015,8 +1062,16 @@ class Database {
     // hold the Connection instance.
     Connection unique_conn();
 
-    // Destructor.  This object should be destroyed while any Connections produced by this object
-    // still remain.
+    /// What interrupts this Database's SQL from another thread; see InterruptHandle.
+    std::shared_ptr<InterruptHandle> interrupt_handle() const { return _interrupt; }
+
+    /// How long the destructor waits for connections still borrowed when it runs, after
+    /// interrupting what they are doing.
+    static constexpr std::chrono::milliseconds DESTROY_DRAIN_TIMEOUT{2000};
+
+    // Destructor.  Should not run while Connections produced by this object remain; if some do,
+    // it interrupts their SQL and waits up to DESTROY_DRAIN_TIMEOUT for them to be released,
+    // rather than freeing what they are using under them.
     ~Database();
 };
 

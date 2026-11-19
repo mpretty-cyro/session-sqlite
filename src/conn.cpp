@@ -6,6 +6,26 @@
 
 namespace session::sqlite::detail {
 
+conn::~conn() {
+    if (_interrupt)
+        _interrupt->remove(sql.getHandle());
+}
+
+void conn::join(std::shared_ptr<InterruptHandle> handle) {
+    _interrupt = std::move(handle);
+    auto* db = sql.getHandle();
+    _interrupt->add(db);
+    // sqlite3_interrupt stops only the statements running when it is called, and those that
+    // start while they are still running; this stops the ones that start after.  Every 1000
+    // virtual machine instructions, which is often enough to stop a long statement within
+    // milliseconds and rare enough to cost nothing measurable.
+    sqlite3_progress_handler(
+            db,
+            1000,
+            [](void* h) -> int { return static_cast<InterruptHandle*>(h)->interrupted() ? 1 : 0; },
+            _interrupt.get());
+}
+
 StatementWrapper conn::prepared_st(std::string_view query) {
     // If you hit this assert hang your head in shame for not following the ridiculous number of
     // times you have been told not to use a Connection across threads:

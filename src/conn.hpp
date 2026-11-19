@@ -30,6 +30,17 @@ class conn {
     template <typename... Args>
     conn(Args&&... args) : sql{std::forward<Args>(args)...} {}
 
+    // Leaves the interrupt handle before `sql` closes, so interrupt() never reaches a closed
+    // connection.
+    ~conn();
+
+    conn(const conn&) = delete;
+    conn& operator=(const conn&) = delete;
+
+    // Joins `handle`: interrupting it interrupts this connection's statements, and makes its
+    // progress handler abort every statement started after.
+    void join(std::shared_ptr<InterruptHandle> handle);
+
     void reset_thread() { _thread = std::this_thread::get_id(); }
 
     StatementWrapper prepared_st(std::string_view query);
@@ -51,6 +62,8 @@ class conn {
     bool checkpoint_due = false;
 
   private:
+    std::shared_ptr<InterruptHandle> _interrupt;
+
     // In WAL frames; 0 for no automatic checkpoints.
     int _wal_autocheckpoint = 0;
 

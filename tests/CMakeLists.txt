@@ -1,6 +1,7 @@
 add_subdirectory(Catch2)
 
 add_executable(testAll
+    test_interrupt.cpp
     test_memory.cpp
     test_transactions.cpp)
 

@@ -280,6 +280,7 @@ void Database::conn_returned() {
         } else
             ++it;
     }
+    _conn_returned_cv.notify_all();
 }
 
 void Database::set_max_idle_conns(int max_idle) {
@@ -305,6 +306,8 @@ Connection Database::get_or_make_conn(std::thread::id tid, int extra_open_flags)
 
     auto conn = std::make_shared<detail::conn>(
             _db_path, _open_flags | extra_open_flags, static_cast<int>(_busy_timeout.count()));
+    conn->join(_interrupt);
+    _interrupt->attach(_write_lock);
 
     auto& sql = conn->sql;
 
@@ -432,13 +435,23 @@ Connection Database::get_or_make_conn(std::thread::id tid, int extra_open_flags)
     return c;
 }
 
+namespace {
+    [[noreturn]] void throw_interrupted() {
+        throw SQLite::Exception{"the database has been interrupted", SQLITE_INTERRUPT};
+    }
+}  // namespace
+
 Connection Database::unique_conn() {
     std::lock_guard lock{_conn_mutex};
+    if (_interrupt->interrupted())
+        throw_interrupted();
     return get_or_make_conn(std::thread::id{});
 }
 
 Connection Database::conn() {
     std::lock_guard lock{_conn_mutex};
+    if (_interrupt->interrupted())
+        throw_interrupted();
 
     auto t = std::this_thread::get_id();
     for (auto& [th, conn] : _conn_in_use)
@@ -449,11 +462,55 @@ Connection Database::conn() {
 }
 
 Database::~Database() {
+    std::unique_lock lock{_conn_mutex};
+    if (!_conn_in_use.empty()) {
+        // Something still holds a connection, which it would go on using after this returns.
+        // Interrupt what it is doing, so that it lets go, and wait a bounded time for it.
+        lock.unlock();
+        _interrupt->interrupt();
+        lock.lock();
+        _conn_returned_cv.wait_for(
+                lock, DESTROY_DRAIN_TIMEOUT, [this] { return _conn_in_use.empty(); });
+    }
     assert(_conn_in_use.empty());
+    lock.unlock();
+    // The write lock is about to go; the connections leave the handle as they close below.
+    _interrupt->detach();
+}
+
+void InterruptHandle::interrupt() {
+    std::lock_guard lock{_mutex};
+    _interrupted.store(true, std::memory_order_release);
+    for (auto* handle : _handles)
+        sqlite3_interrupt(handle);
+    if (_write_lock)
+        _write_lock->abort();
+}
+
+void InterruptHandle::add(::sqlite3* handle) {
+    std::lock_guard lock{_mutex};
+    _handles.push_back(handle);
+}
+
+void InterruptHandle::remove(::sqlite3* handle) {
+    std::lock_guard lock{_mutex};
+    std::erase(_handles, handle);
+}
+
+void InterruptHandle::attach(detail::fifo_lock& write_lock) {
+    std::lock_guard lock{_mutex};
+    _write_lock = &write_lock;
+}
+
+void InterruptHandle::detach() {
+    std::lock_guard lock{_mutex};
+    _write_lock = nullptr;
 }
 
 bool detail::fifo_lock::lock_until(std::chrono::steady_clock::time_point deadline) {
     std::unique_lock lock{_mutex};
+    if (_aborted)
+        return false;
     if (!_held && _queue.empty()) {
         _held = true;
         _owner = std::this_thread::get_id();
@@ -461,7 +518,10 @@ bool detail::fifo_lock::lock_until(std::chrono::steady_clock::time_point deadlin
     }
     const auto ticket = _next_ticket++;
     _queue.push_back(ticket);
-    if (_cv.wait_until(lock, deadline, [&] { return !_held && _queue.front() == ticket; })) {
+    if (_cv.wait_until(lock, deadline, [&] {
+            return _aborted || (!_held && _queue.front() == ticket);
+        }) &&
+        !_aborted) {
         _queue.pop_front();
         _held = true;
         _owner = std::this_thread::get_id();
@@ -474,6 +534,14 @@ bool detail::fifo_lock::lock_until(std::chrono::steady_clock::time_point deadlin
     if (was_front)
         _cv.notify_all();
     return false;
+}
+
+void detail::fifo_lock::abort() {
+    {
+        std::lock_guard lock{_mutex};
+        _aborted = true;
+    }
+    _cv.notify_all();
 }
 
 void detail::fifo_lock::unlock() {
@@ -507,7 +575,9 @@ ImmediateTransaction::ImmediateTransaction(
     _requested = std::chrono::steady_clock::now();
     const auto deadline = _requested + budget;
     if (!db._write_lock.lock_until(deadline))
-        throw SQLite::Exception{"database is locked", SQLITE_BUSY};
+        throw db._interrupt->interrupted()
+                ? SQLite::Exception{"the database has been interrupted", SQLITE_INTERRUPT}
+                : SQLite::Exception{"database is locked", SQLITE_BUSY};
 
     // The budget bounds the whole call, so BEGIN's busy handler gets only what waiting for
     // _write_lock left of it, and the connection has its usual busy timeout back afterwards.  A
